@@ -1,149 +1,170 @@
 #!/usr/bin/env python3
-"""Build the 21 November 2026 world-news front page for make.fun.
+"""Render the 21 November 2026 front page (1024x1024) over news-bg.png.
 
-The backdrop is an AI-made dotted world map with no writing on it at
-all. Every letter the judge sees is painted here with PIL, so the text
-stays sharp when the image is shrunk to a thumbnail. The page is a
-newspaper front: a masthead with the day, then the five stories that
-led Saturday 21 November 2026, each in its own card with a headline, a
-single factual line and the place it happened.
-
-Stories were checked on 21 Nov 2026 against the OneTurn world brief,
-WW6RAG, the Augerton Digest, Kilambi News, Reuters, the BBC, the
-Guardian and Channel 4 News: the Friday market plunge (Nasdaq -5.3%,
-S&P into correction, Nvidia -14% on the SEC probe report), Russia's
-mass strike on Ukraine with missiles landing in Poland, Mexico's
-capture of FBI most-wanted cartel boss "El Chapo Isidro", the FBI's
-probe into a breach of its national crime database, and the
-daraxonrasib pancreatic-cancer pill trial. Nothing here is invented;
-second-tier items (COP31 overtime — already the previous day's story,
-the Timor-Leste quake, Denmark's expulsion of a Russian diplomat) were
-left out.
+Standalone renderer: Python 3 + Pillow, no network. Reads the dotted-map
+backdrop next to this script, dims it, then paints the masthead, five
+numbered story cards and the footer in plain painted text.
 """
+
+from __future__ import annotations
+
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-BACKDROP = BASE_DIR / "news-bg.png"
-TARGET = BASE_DIR / "entry.png"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 
 EDGE = 1024
-BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-PLAIN = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+MARGIN = 44
+GOLD = (233, 179, 74)
+PAPER = (244, 246, 248)
+MIST = (206, 216, 224)
+CARD_FILL = (15, 41, 62, 208)
+RULE_LIGHT = (150, 168, 186)
 
-INK = (9, 25, 38)
-PANEL = (17, 41, 60)
-AMBER = (224, 169, 78)
-PAPER = (243, 244, 246)
-GREY = (188, 198, 210)
-STRIPES = [(224, 169, 78), (196, 82, 74), (86, 158, 143), (214, 126, 58), (106, 144, 204)]
+FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
+BOLD_PATH = FONT_DIR / "DejaVuSans-Bold.ttf"
+PLAIN_PATH = FONT_DIR / "DejaVuSans.ttf"
 
-CARDS = [
+# (number, accent colour, headline, body incl. dateline)
+ITEMS = [
     (
+        "01",
+        (233, 179, 74),
         "MARKETS PLUNGE",
-        "Nasdaq falls 5.3%, S&P enters correction; Nvidia drops 14% on SEC probe report",
-        "NEW\u00a0YORK",
+        "Nasdaq falls 5.3%, S&P enters correction; Nvidia drops 14% on SEC "
+        "probe report \u2014 NEW YORK",
     ),
     (
+        "02",
+        (216, 92, 84),
         "MISSILES LAND IN POLAND",
-        "Russia fires 400+ drones and 110 missiles at Ukraine; two missiles and a drone come down in Poland",
-        "WARSAW",
+        "Russia fires 400+ drones and 110 missiles at Ukraine; two missiles "
+        "and a drone come down in Poland \u2014 WARSAW",
     ),
     (
+        "03",
+        (112, 192, 172),
         "EL CHAPO ISIDRO CAPTURED",
-        "Mexico captures FBI most-wanted cartel boss Fausto Isidro Meza Flores in Sinaloa",
-        "GUASAVE",
+        "Mexico captures FBI most-wanted cartel boss Fausto Isidro Meza "
+        "Flores in Sinaloa \u2014 GUASAVE",
     ),
     (
+        "04",
+        (234, 132, 62),
         "FBI PROBES DATABASE BREACH",
-        "Hackers reported inside the FBI's national crime database; a USDA payment system also hit",
-        "WASHINGTON",
+        "Hackers reported inside the FBI's national crime database; a USDA "
+        "payment system also hit \u2014 WASHINGTON",
     ),
     (
+        "05",
+        (132, 172, 226),
         "CANCER PILL BREAKTHROUGH",
-        "Daraxonrasib halts tumour growth in 90% of patients; tumours vanish in 1 in 12",
-        "BARCELONA",
+        "Daraxonrasib halts tumour growth in 90% of patients; tumours "
+        "vanish in 1 in 12 \u2014 BARCELONA",
     ),
 ]
 
 
-def load(size):
-    return ImageFont.truetype(BOLD if size[1] else PLAIN, size[0])
+def font(path: Path, size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(path), size)
 
 
-def fit_lines(canvas, text, typeface, width):
-    """Split text into as few lines as fit inside width.
+def fit_text(draw: ImageDraw.ImageDraw, text: str, path: Path,
+             start: int, limit: int) -> ImageFont.FreeTypeFont:
+    """Largest bold size (down to 20) that keeps `text` within `limit` px."""
+    size = start
+    while size > 20:
+        f = font(path, size)
+        if draw.textlength(text, font=f) <= limit:
+            return f
+        size -= 1
+    return font(path, 20)
 
-    Splits on plain spaces only, so a non-breaking space inside a
-    dateline keeps the two words on the same line.
-    """
-    words = text.split(" ")
-    lines, current = [], ""
-    for word in words:
+
+def wrap(draw: ImageDraw.ImageDraw, text: str, f: ImageFont.FreeTypeFont,
+         limit: int) -> list[str]:
+    out: list[str] = []
+    current = ""
+    for word in text.split():
         trial = f"{current} {word}".strip()
-        if canvas.textlength(trial, font=typeface) <= width:
+        if draw.textlength(trial, font=f) <= limit:
             current = trial
         else:
-            lines.append(current)
+            if current:
+                out.append(current)
             current = word
     if current:
-        lines.append(current)
-    return lines
+        out.append(current)
+    return out
 
 
-def build():
-    photo = Image.open(BACKDROP).convert("RGB")
-    photo = photo.resize((EDGE, EDGE), Image.LANCZOS)
-    veil = Image.new("RGB", photo.size, (7, 17, 30))
-    page = Image.blend(photo, veil, 0.5)
-    pen = ImageDraw.Draw(page, "RGBA")
+def backdrop() -> Image.Image:
+    """news-bg.png centre-cropped to a square, then darkened for contrast."""
+    raw = Image.open(ROOT / "news-bg.png").convert("RGB")
+    w, h = raw.size
+    side = min(w, h)
+    raw = raw.crop(((w - side) // 2, (h - side) // 2,
+                    (w + side) // 2, (h + side) // 2))
+    raw = raw.resize((EDGE, EDGE), Image.LANCZOS)
+    veil = Image.new("RGB", (EDGE, EDGE), (6, 20, 34))
+    return Image.blend(raw, veil, 0.42)
 
-    # Masthead: title, gold rule, day line, pale rule.
-    pen.text((EDGE // 2, 34), "WORLD NEWS", font=load((92, True)),
-             fill=PAPER, anchor="ma")
-    pen.rectangle([52, 138, EDGE - 52, 141], fill=AMBER)
-    pen.text((EDGE // 2, 152), "SATURDAY  \u2022  21 NOVEMBER 2026",
-             font=load((40, True)), fill=AMBER, anchor="ma")
-    pen.rectangle([52, 212, EDGE - 52, 215], fill=(118, 133, 156))
 
-    # One card per story.
-    top = 234
-    height, space = 138, 12
-    number_face = load((54, True))
-    head_face = load((35, True))
-    body_face = load((22, False))
-    for index, (headline, detail, place) in enumerate(CARDS):
-        stripe = STRIPES[index]
-        pen.rounded_rectangle([52, top, EDGE - 52, top + height], radius=10,
-                              fill=PANEL + (230,))
-        pen.rectangle([52, top + 10, 62, top + height - 10], fill=stripe)
-        pen.text((96, top + height // 2), f"{index + 1:02d}",
-                 font=number_face, fill=stripe, anchor="lm")
-        text_x = 196
-        text_w = EDGE - 52 - text_x - 26
-        head_lines = fit_lines(pen, headline, head_face, text_w)
-        cursor = top + 18
-        for line in head_lines[:2]:
-            pen.text((text_x, cursor), line, font=head_face,
-                     fill=PAPER, anchor="la")
-            cursor += 42
-        body = f"{detail}  \u2014  {place}"
-        body_lines = fit_lines(pen, body, body_face, text_w)
-        cursor = max(top + 66, cursor + 6)
-        for line in body_lines[:2]:
-            pen.text((text_x, cursor), line, font=body_face,
-                     fill=GREY, anchor="la")
-            cursor += 28
-        top += height + space
+def masthead(draw: ImageDraw.ImageDraw) -> None:
+    title = font(BOLD_PATH, 98)
+    draw.text((EDGE // 2, 24), "WORLD NEWS", font=title, fill=PAPER,
+              anchor="ma")
+    draw.line([(MARGIN, 148), (EDGE - MARGIN, 148)], fill=GOLD, width=4)
+    sub = font(BOLD_PATH, 41)
+    draw.text((EDGE // 2, 164), "SATURDAY \u2022 21 NOVEMBER 2026",
+              font=sub, fill=GOLD, anchor="ma")
+    draw.line([(MARGIN, 224), (EDGE - MARGIN, 224)], fill=RULE_LIGHT,
+              width=3)
 
-    # Footer.
-    pen.text((EDGE // 2, 984), "THE DAY IN FIVE STORIES  \u2022  21 NOVEMBER 2026",
-             font=load((23, False)), fill=GREY, anchor="ma")
 
-    page.save(TARGET, "PNG", optimize=True)
-    print(f"saved {TARGET} {page.size} {TARGET.stat().st_size} bytes")
+def story_card(draw: ImageDraw.ImageDraw, top: int, height: int,
+               number: str, accent: tuple[int, int, int],
+               headline: str, body: str) -> None:
+    draw.rounded_rectangle(
+        [MARGIN, top, EDGE - MARGIN, top + height], radius=10,
+        fill=CARD_FILL)
+    draw.rectangle([MARGIN, top + 12, MARGIN + 9, top + height - 12],
+                   fill=accent)
+    num_font = font(BOLD_PATH, 54)
+    draw.text((MARGIN + 34, top + height // 2), number, font=num_font,
+              fill=accent, anchor="lm")
+    head_font = fit_text(draw, headline, BOLD_PATH, 40, 770)
+    text_x = MARGIN + 128
+    draw.text((text_x, top + 22), headline, font=head_font, fill=PAPER)
+    body_font = font(PLAIN_PATH, 25)
+    lines = wrap(draw, body, body_font, EDGE - MARGIN - text_x - 18)
+    y = top + 68
+    for line in lines[:2]:
+        draw.text((text_x, y), line, font=body_font, fill=MIST)
+        y += 31
+
+
+def main() -> None:
+    canvas = backdrop()
+    draw = ImageDraw.Draw(canvas, "RGBA")
+
+    masthead(draw)
+
+    card_h, gap, first = 126, 14, 244
+    for i, (number, accent, headline, body) in enumerate(ITEMS):
+        story_card(draw, first + i * (card_h + gap), card_h,
+                   number, accent, headline, body)
+
+    foot = font(PLAIN_PATH, 26)
+    draw.text((EDGE // 2, 946), "THE DAY IN FIVE STORIES \u2022 21 NOVEMBER 2026",
+              font=foot, fill=MIST, anchor="ma")
+
+    out = ROOT / "entry.png"
+    canvas.convert("RGB").save(out, "PNG", optimize=True)
+    print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":
-    build()
+    main()
